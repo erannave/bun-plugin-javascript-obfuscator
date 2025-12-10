@@ -5,7 +5,9 @@ A Bun bundler plugin that integrates [javascript-obfuscator](https://github.com/
 ## Features
 
 - **TypeScript Support**: Works seamlessly with TypeScript files - Bun handles compilation before obfuscation
-- **Separate Vendor Bundles**: Automatically bundles node_modules separately (not obfuscated) for better performance
+- **Separate Vendor Bundles**: Automatically bundles node_modules separately (not obfuscated) and rewrites imports so everything works at runtime
+- **Recursive Dependency Scanning**: Automatically discovers all external dependencies by scanning your entire codebase
+- **Comment-Aware**: Ignores imports in commented-out code
 - **Minification Support**: Apply Bun's minification before obfuscation for optimal code size
 - **Full Obfuscator Options**: All [javascript-obfuscator options](https://github.com/javascript-obfuscator/javascript-obfuscator#javascript-obfuscator-options) are supported
 
@@ -21,8 +23,9 @@ bun add bun-plugin-javascript-obfuscator
 
 The `obfuscatedBuild` function provides a complete build pipeline that:
 1. Uses Bun to compile TypeScript to JavaScript and apply minification
-2. Bundles node_modules into a separate vendor file (not obfuscated)
-3. Applies obfuscation only to your application code
+2. Applies obfuscation to your application code
+3. Bundles node_modules into a separate vendor file (not obfuscated)
+4. Rewrites imports in the main bundle to use the vendor bundle
 
 ```typescript
 import { obfuscatedBuild } from "bun-plugin-javascript-obfuscator";
@@ -88,6 +91,7 @@ The main build function that provides full TypeScript support and vendor bundle 
 | `nodeModulesBundleName` | `string` | `"vendor.js"` | Name of the vendor bundle file |
 | `isExternal` | `(path: string) => boolean` | (see below) | Custom function to identify external modules |
 | `plugins` | `BunPlugin[]` | `[]` | Additional Bun plugins to run before obfuscation |
+| `external` | `string[]` | `[]` | Modules to exclude from both main and vendor bundles (e.g., native modules) |
 
 **Default `isExternal` behavior**: Modules are considered external if they:
 - Contain `node_modules` in the path
@@ -130,7 +134,7 @@ await obfuscatedBuild({
   entrypoints: ["./src/index.ts"],
   outdir: "./dist",
   minify: true,
-  target: "browser",
+  target: "bun",
 
   obfuscator: {
     compact: true,
@@ -148,6 +152,33 @@ await obfuscatedBuild({
     stringArrayEncoding: ["base64"],
     stringArrayThreshold: 0.75,
   },
+});
+```
+
+### With Native Module Exclusions
+
+When using native modules that can't be bundled (e.g., modules with `.node` files), exclude them:
+
+```typescript
+await obfuscatedBuild({
+  entrypoints: ["./src/index.ts"],
+  outdir: "./dist",
+  minify: true,
+
+  obfuscator: {
+    compact: true,
+    stringArray: true,
+  },
+
+  // These modules will remain as external requires
+  external: [
+    "argon2",           // Native crypto module
+    "nodejs-polars",    // Has .node files
+    "better-sqlite3",   // Native SQLite bindings
+  ],
+
+  bundleNodeModules: true,
+  nodeModulesBundleName: "vendor.js",
 });
 ```
 
@@ -208,7 +239,7 @@ await obfuscatedBuild({
 
 ## How It Works
 
-1. **Dependency Analysis**: The build function scans your source files for import/require statements to identify external dependencies.
+1. **Dependency Analysis**: The build function recursively scans all your source files (starting from entrypoints) for import/require statements to identify external dependencies. Comments are stripped before scanning to avoid false positives from commented-out code.
 
 2. **Phase 1 - Bun Compilation**: Your TypeScript/JavaScript code is compiled and bundled by Bun with node_modules marked as external. This phase handles:
    - TypeScript to JavaScript compilation
@@ -218,10 +249,15 @@ await obfuscatedBuild({
 
 3. **Phase 2 - Obfuscation**: The bundled JavaScript output is passed through javascript-obfuscator with your specified options.
 
-4. **Phase 3 - Vendor Bundle**: If `bundleNodeModules` is enabled, external dependencies are bundled into a separate file without obfuscation. This is intentional because:
-   - Third-party code is already public
-   - Obfuscating libraries can cause issues with minified code
-   - Keeping vendor code readable helps with debugging
+4. **Phase 3 - Vendor Bundle**: If `bundleNodeModules` is enabled:
+   - External dependencies are bundled into a separate vendor file (not obfuscated)
+   - The main bundle is rewritten to import from the vendor bundle instead of the original package names
+   - All import styles are handled: `import x from`, `import * as x from`, `import { a, b } from`, and `require()`
+
+This approach keeps your application code obfuscated while:
+- Third-party code remains readable (it's already public anyway)
+- Avoiding issues that can occur when obfuscating already-minified library code
+- Making debugging easier by keeping vendor code readable
 
 ## TypeScript Support
 

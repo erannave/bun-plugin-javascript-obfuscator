@@ -1,7 +1,7 @@
 import type { BunPlugin, BuildConfig, BuildOutput, BuildArtifact } from "bun";
 import JavaScriptObfuscator from "javascript-obfuscator";
 import type { ObfuscatorOptions } from "javascript-obfuscator";
-import { existsSync, mkdirSync, writeFileSync, readFileSync } from "fs";
+import { existsSync, mkdirSync, writeFileSync, readFileSync, statSync } from "fs";
 import { dirname, basename, join, resolve } from "path";
 
 /**
@@ -84,7 +84,76 @@ function defaultIsExternal(modulePath: string): boolean {
 }
 
 /**
- * Collects all external dependencies from the build metafile.
+ * Escapes special regex characters in a string.
+ */
+function escapeRegExp(string: string): string {
+  return string.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+}
+
+/**
+ * Validates that a string looks like a valid import path.
+ * Filters out false positives from template literals, etc.
+ */
+function isValidImportPath(path: string): boolean {
+  // Must not be empty
+  if (!path || path.trim().length === 0) return false;
+
+  // Must not contain newlines
+  if (path.includes("\n") || path.includes("\r")) return false;
+
+  // Must not contain template literal syntax
+  if (path.includes("${") || path.includes("}")) return false;
+
+  // Must not start with whitespace
+  if (path !== path.trim()) return false;
+
+  // Must not contain characters invalid in module specifiers
+  // Valid: alphanumeric, ., /, -, _, @, :
+  if (!/^[@a-zA-Z0-9._\-/:]+$/.test(path)) return false;
+
+  // Must not be just punctuation
+  if (/^[./_@-]+$/.test(path)) return false;
+
+  return true;
+}
+
+/**
+ * Resolves a relative import path from a source file.
+ */
+function resolveLocalImport(importPath: string, fromFile: string): string | null {
+  if (!importPath.startsWith(".") && !importPath.startsWith("/")) {
+    return null; // Not a local import
+  }
+
+  const dir = dirname(fromFile);
+  let resolved = resolve(dir, importPath);
+
+  // Try different extensions if the path doesn't have one
+  const extensions = [".ts", ".tsx", ".js", ".jsx", ".mjs", ".cjs", ""];
+  const indexFiles = ["index.ts", "index.tsx", "index.js", "index.jsx", "index.mjs"];
+
+  for (const ext of extensions) {
+    const withExt = resolved + ext;
+    if (existsSync(withExt)) {
+      return withExt;
+    }
+  }
+
+  // Try as a directory with index file
+  if (existsSync(resolved) && statSync(resolved).isDirectory()) {
+    for (const indexFile of indexFiles) {
+      const indexPath = join(resolved, indexFile);
+      if (existsSync(indexPath)) {
+        return indexPath;
+      }
+    }
+  }
+
+  return null;
+}
+
+/**
+ * Collects all external dependencies by recursively scanning source files.
  */
 function collectExternalDependencies(
   entrypoints: string[],
@@ -92,41 +161,57 @@ function collectExternalDependencies(
 ): Set<string> {
   const externals = new Set<string>();
   const visited = new Set<string>();
-  const queue = [...entrypoints];
+  const queue = entrypoints.map(e => resolve(e));
 
   while (queue.length > 0) {
     const file = queue.shift()!;
     if (visited.has(file)) continue;
     visited.add(file);
 
-    try {
-      const resolvedPath = resolve(file);
-      if (!existsSync(resolvedPath)) continue;
+    if (!existsSync(file)) continue;
 
-      const content = readFileSync(resolvedPath, "utf-8");
+    try {
+      let content = readFileSync(file, "utf-8");
+
+      // Strip comments to avoid matching imports in commented-out code
+      // Remove single-line comments (// ...)
+      content = content.replace(/\/\/.*$/gm, "");
+      // Remove multi-line comments (/* ... */)
+      content = content.replace(/\/\*[\s\S]*?\*\//g, "");
 
       // Match import/require statements
       const importRegex = /(?:import|export)(?:\s+(?:[\w*{}\s,]+)\s+from)?\s*['"]([^'"]+)['"]/g;
       const requireRegex = /require\s*\(\s*['"]([^'"]+)['"]\s*\)/g;
       const dynamicImportRegex = /import\s*\(\s*['"]([^'"]+)['"]\s*\)/g;
 
+      const allImports: string[] = [];
+
       let match;
       while ((match = importRegex.exec(content)) !== null) {
-        const dep = match[1];
-        if (isExternal(dep)) {
-          externals.add(dep);
-        }
+        allImports.push(match[1]);
       }
       while ((match = requireRegex.exec(content)) !== null) {
-        const dep = match[1];
-        if (isExternal(dep)) {
-          externals.add(dep);
-        }
+        allImports.push(match[1]);
       }
       while ((match = dynamicImportRegex.exec(content)) !== null) {
-        const dep = match[1];
+        allImports.push(match[1]);
+      }
+
+      for (const dep of allImports) {
+        // Skip invalid import paths (template literals, strings with newlines, etc.)
+        if (!isValidImportPath(dep)) {
+          continue;
+        }
+
         if (isExternal(dep)) {
+          // External dependency - add to externals set
           externals.add(dep);
+        } else {
+          // Local dependency - resolve and add to queue for scanning
+          const resolvedLocal = resolveLocalImport(dep, file);
+          if (resolvedLocal && !visited.has(resolvedLocal)) {
+            queue.push(resolvedLocal);
+          }
         }
       }
     } catch {
@@ -250,12 +335,22 @@ export async function obfuscatedBuild(options: ObfuscatorBuildOptions): Promise<
   let vendorOutput: BuildOutput | undefined;
 
   if (bundleNodeModules && externalArray.length > 0) {
-    // Create a temporary entry file that imports all external dependencies
+    // Create a mapping from package name to export name
+    const depMapping: Record<string, string> = {};
+    externalArray.forEach((dep, i) => {
+      depMapping[dep] = `_dep${i}`;
+    });
+
+    // Create a temporary entry file in the same directory as the first entrypoint
+    // so that Bun can resolve node_modules correctly (it looks relative to the entry file)
     const vendorEntryContent = externalArray
       .map((dep, i) => `export * as _dep${i} from "${dep}";`)
       .join("\n");
 
-    const vendorEntryPath = join(outdir, "__vendor_entry__.js");
+    // Place the vendor entry file next to the first entrypoint so node_modules resolves correctly
+    const firstEntrypoint = resolve(entrypoints[0]);
+    const entrypointDir = dirname(firstEntrypoint);
+    const vendorEntryPath = join(entrypointDir, `__vendor_entry_${Date.now()}.js`);
     writeFileSync(vendorEntryPath, vendorEntryContent, "utf-8");
 
     try {
@@ -266,7 +361,8 @@ export async function obfuscatedBuild(options: ObfuscatorBuildOptions): Promise<
         target: buildOptions.target,
         format: buildOptions.format,
         naming: nodeModulesBundleName,
-        // Don't mark anything as external for the vendor bundle
+        // Pass through the same external modules that shouldn't be bundled
+        external: buildOptions.external,
       });
 
       // Clean up temporary entry file
@@ -276,6 +372,56 @@ export async function obfuscatedBuild(options: ObfuscatorBuildOptions): Promise<
       if (!vendorOutput.success) {
         console.warn("[bun-plugin-javascript-obfuscator] Warning: Failed to bundle node_modules");
         console.warn(vendorOutput.logs);
+      } else {
+        // Rewrite the main bundle(s) to import from vendor bundle instead of external packages
+        const vendorBundlePath = "./" + nodeModulesBundleName;
+
+        for (const output of obfuscatedOutputs) {
+          if (output.path.endsWith(".js") || output.path.endsWith(".mjs")) {
+            let code = readFileSync(output.path, "utf-8");
+
+            // Build the vendor import statement
+            const vendorImports = externalArray.map((_, i) => `_dep${i}`).join(", ");
+            const vendorImportStatement = `import { ${vendorImports} } from "${vendorBundlePath}";\n`;
+
+            // Replace each external import with a reference to the vendor bundle export
+            for (const dep of externalArray) {
+              const exportName = depMapping[dep];
+              // Match various import patterns and replace with vendor reference
+              // Handle: import x from "pkg"
+              const defaultImportRegex = new RegExp(`import\\s+(\\w+)\\s+from\\s*["']${escapeRegExp(dep)}["']`, 'g');
+              code = code.replace(defaultImportRegex, `const $1 = ${exportName}.default || ${exportName}`);
+
+              // Handle: import * as x from "pkg"
+              const namespaceImportRegex = new RegExp(`import\\s*\\*\\s*as\\s+(\\w+)\\s+from\\s*["']${escapeRegExp(dep)}["']`, 'g');
+              code = code.replace(namespaceImportRegex, `const $1 = ${exportName}`);
+
+              // Handle: import { a, b } from "pkg"
+              const namedImportRegex = new RegExp(`import\\s*\\{([^}]+)\\}\\s*from\\s*["']${escapeRegExp(dep)}["']`, 'g');
+              code = code.replace(namedImportRegex, (_match, imports) => {
+                const importList = imports.split(',').map((s: string) => s.trim()).filter((s: string) => s);
+                const destructured = importList.map((imp: string) => {
+                  // Handle "x as y" syntax
+                  const asMatch = imp.match(/(\w+)\s+as\s+(\w+)/);
+                  if (asMatch) {
+                    return `${asMatch[1]}: ${asMatch[2]}`;
+                  }
+                  return imp;
+                }).join(', ');
+                return `const { ${destructured} } = ${exportName}`;
+              });
+
+              // Handle: require("pkg")
+              const requireRegex = new RegExp(`require\\s*\\(\\s*["']${escapeRegExp(dep)}["']\\s*\\)`, 'g');
+              code = code.replace(requireRegex, exportName);
+            }
+
+            // Add the vendor import at the top of the file
+            code = vendorImportStatement + code;
+
+            writeFileSync(output.path, code, "utf-8");
+          }
+        }
       }
     } catch (error) {
       console.warn("[bun-plugin-javascript-obfuscator] Warning: Failed to bundle node_modules:", error);
