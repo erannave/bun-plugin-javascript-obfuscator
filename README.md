@@ -92,6 +92,8 @@ The main build function that provides full TypeScript support and vendor bundle 
 | `isExternal` | `(path: string) => boolean` | (see below) | Custom function to identify external modules |
 | `plugins` | `BunPlugin[]` | `[]` | Additional Bun plugins to run before obfuscation |
 | `external` | `string[]` | `[]` | Modules to exclude from both main and vendor bundles (e.g., native modules) |
+| `skipVendorBundleGeneration` | `boolean` | `false` | Skip generating vendor bundle but still rewrite imports to use an existing one |
+| `existingVendorBundlePath` | `string` | `undefined` | Path to existing vendor bundle (for validation when using `skipVendorBundleGeneration`) |
 
 **Default `isExternal` behavior**: Modules are considered external if they:
 - Contain `node_modules` in the path
@@ -236,6 +238,46 @@ await obfuscatedBuild({
   },
 });
 ```
+
+### Shared Vendor Bundle (Multiple Builds)
+
+When building multiple entrypoints separately (e.g., main app and worker scripts), you can share a single vendor bundle:
+
+```typescript
+const outdir = "./dist";
+const obfuscatorConfig = { compact: true, stringArray: true };
+
+// First build: generates vendor.js
+const mainResult = await obfuscatedBuild({
+  entrypoints: ["./src/index.ts"],
+  outdir,
+  minify: true,
+  obfuscator: obfuscatorConfig,
+  bundleNodeModules: true,
+  nodeModulesBundleName: "vendor.js",
+});
+
+// Second build: reuses existing vendor.js
+const workerResult = await obfuscatedBuild({
+  entrypoints: [
+    "./src/workers/worker1.ts",
+    "./src/workers/worker2.ts",
+  ],
+  outdir,
+  minify: true,
+  obfuscator: obfuscatorConfig,
+  bundleNodeModules: true,
+  nodeModulesBundleName: "vendor.js",
+  // Skip generating vendor.js, just rewrite imports to use the existing one
+  skipVendorBundleGeneration: true,
+  existingVendorBundlePath: `${outdir}/vendor.js`,
+});
+```
+
+This approach:
+- Generates the vendor bundle only once (from the first build)
+- Rewrites imports in all builds to reference the shared vendor bundle
+- Avoids duplicating dependencies across multiple output files
 
 ## How It Works
 

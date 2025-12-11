@@ -1,6 +1,6 @@
 {
   "name": "bun-plugin-javascript-obfuscator",
-  "version": "1.0.0",
+  "version": "1.0.1",
   "description": "A Bun bundler plugin that integrates javascript-obfuscator for code obfuscation during builds",
   "main": "dist/index.js",
   "module": "dist/index.js",
